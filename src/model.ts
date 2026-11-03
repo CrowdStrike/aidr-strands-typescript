@@ -79,6 +79,7 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
   readonly guardInput: boolean
   readonly guardOutput: boolean
   readonly failOpen: boolean
+  readonly guardTimeoutMs: number
 
   private readonly downstream: Model<T>
   private readonly aidrConfig: AIGuardModelConfig
@@ -93,6 +94,8 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
       guardInput?: boolean
       guardOutput?: boolean
       failOpen?: boolean
+      /** Milliseconds before an AIDR guard call is aborted. Default: 30 000. */
+      guardTimeoutMs?: number
     } = {},
   ) {
     super()
@@ -110,6 +113,7 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
     this.guardInput = options.guardInput ?? true
     this.guardOutput = options.guardOutput ?? true
     this.failOpen = options.failOpen ?? false
+    this.guardTimeoutMs = options.guardTimeoutMs ?? 30_000
     this.aidr = new AIGuard({ token, baseURLTemplate })
   }
 
@@ -189,9 +193,15 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
 
   private async callAidr(eventType: 'input' | 'output', guardInput: { [key: string]: unknown }): Promise<AidrResult | null> {
     const body = this.buildAidrBody(guardInput, eventType)
-    const response = await this.aidr.guardChatCompletions(body)
-    // MaybeAcceptedResponse<T> has a .result property when the request completes.
-    return (response as { result?: AidrResult }).result ?? null
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.guardTimeoutMs)
+    try {
+      const response = await this.aidr.guardChatCompletions(body, { signal: controller.signal })
+      // MaybeAcceptedResponse<T> has a .result property when the request completes.
+      return (response as { result?: AidrResult }).result ?? null
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   private async runInputGuard(messages: Message[], options?: StreamOptions): Promise<Message[]> {

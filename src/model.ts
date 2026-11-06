@@ -33,7 +33,7 @@ import {
   TextBlock,
 } from '@strands-agents/sdk'
 import type { ToolSpec } from '@strands-agents/sdk'
-import { AIGuardBlockedError } from './errors.js'
+import { AIGuardBlockedError, AIGuardUnavailableError, AIGuardTransformFailedError } from './errors.js'
 import { messagesToOpenAI, toolSpecsToOpenAI } from './convert.js'
 import type { OpenAIMessage } from './convert.js'
 
@@ -78,6 +78,8 @@ interface AidrResult {
 export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends Model<T> {
   readonly guardInput: boolean
   readonly guardOutput: boolean
+  readonly failOpen: boolean
+  readonly guardTimeoutMs: number
 
   private readonly downstream: Model<T>
   private readonly aidrConfig: AIGuardModelConfig
@@ -91,6 +93,9 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
       baseURLTemplate?: string
       guardInput?: boolean
       guardOutput?: boolean
+      failOpen?: boolean
+      /** Milliseconds before an AIDR guard call is aborted. Default: 30 000. */
+      guardTimeoutMs?: number
     } = {},
   ) {
     super()
@@ -107,6 +112,8 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
     this.aidrConfig = aidrConfig
     this.guardInput = options.guardInput ?? true
     this.guardOutput = options.guardOutput ?? true
+    this.failOpen = options.failOpen ?? false
+    this.guardTimeoutMs = options.guardTimeoutMs ?? 30_000
     this.aidr = new AIGuard({ token, baseURLTemplate })
   }
 
@@ -186,9 +193,15 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
 
   private async callAidr(eventType: 'input' | 'output', guardInput: { [key: string]: unknown }): Promise<AidrResult | null> {
     const body = this.buildAidrBody(guardInput, eventType)
-    const response = await this.aidr.guardChatCompletions(body)
-    // MaybeAcceptedResponse<T> has a .result property when the request completes.
-    return (response as { result?: AidrResult }).result ?? null
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.guardTimeoutMs)
+    try {
+      const response = await this.aidr.guardChatCompletions(body, { signal: controller.signal })
+      // MaybeAcceptedResponse<T> has a .result property when the request completes.
+      return (response as { result?: AidrResult }).result ?? null
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   private async runInputGuard(messages: Message[], options?: StreamOptions): Promise<Message[]> {
@@ -200,6 +213,9 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
 
     const result = await this.callAidr('input', guardInput)
     if (result === null) {
+      if (!this.failOpen) {
+        throw new AIGuardUnavailableError('input')
+      }
       return messages
     }
 
@@ -209,6 +225,10 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
 
     if (result.transformed && result.guard_output) {
       return substituteMessages(messages, result.guard_output)
+    }
+
+    if (result.transformed) {
+      throw new AIGuardTransformFailedError('input')
     }
 
     return messages
@@ -230,6 +250,9 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
 
     const result = await this.callAidr('output', guardInput)
     if (result === null) {
+      if (!this.failOpen) {
+        throw new AIGuardUnavailableError('output')
+      }
       return { events: bufferedEvents, replacementText: null }
     }
 
@@ -240,6 +263,10 @@ export class AIGuardModel<T extends BaseModelConfig = BaseModelConfig> extends M
     if (result.transformed && result.guard_output) {
       const { events, replacementText } = rebuildEventsFromGuardOutput(bufferedEvents, result.guard_output)
       return { events, replacementText }
+    }
+
+    if (result.transformed) {
+      throw new AIGuardTransformFailedError('output')
     }
 
     return { events: bufferedEvents, replacementText: null }
@@ -364,8 +391,10 @@ function rebuildEventsFromGuardOutput(
 /**
  * Return a copy of original with text content replaced from guard_output.
  *
- * Only text blocks are updated; the message structure (roles, order, tool
- * calls/results) is preserved.
+ * The indexing mirrors messagesToOpenAI: all text blocks in a Strands message
+ * map to a single OAI message (so they share one oaiIdx), each toolResult
+ * block emits an independent OAI message, and messages with only tool-use
+ * blocks (no text) also consume one index.
  */
 function substituteMessages(
   original: Message[],
@@ -381,17 +410,45 @@ function substituteMessages(
 
   const result: Message[] = []
   let oaiIdx = 0
+
   for (const msg of original) {
+    // Classify blocks to mirror messagesToOpenAI emission order.
+    const hasText = msg.content.some((b) => b.type === 'textBlock')
+    const hasToolUse = msg.content.some((b) => b.type === 'toolUseBlock')
+    const toolResultBlocks = msg.content.filter((b) => b.type === 'toolResultBlock')
+
+    // messagesToOpenAI emits one OAI message for text+toolUse (if either exists)
+    const mainMsgIdx = (hasText || hasToolUse) ? oaiIdx++ : -1
+
+    // Each toolResult emits a separate OAI message
+    const toolResultStartIdx = oaiIdx
+    oaiIdx += toolResultBlocks.length
+
+    // Rebuild blocks, applying text replacement from the main message index
+    const replacement = mainMsgIdx >= 0 ? contentByIndex.get(mainMsgIdx) : undefined
     const newBlocks = msg.content.map((block) => {
-      if (block.type === 'textBlock') {
-        const replacement = contentByIndex.get(oaiIdx++) ?? block.text
-        return new TextBlock(replacement)
-      }
-      if (block.type === 'toolUseBlock' || block.type === 'toolResultBlock') {
-        oaiIdx++ // account for corresponding OAI message
+      if (block.type === 'textBlock' && replacement !== undefined) {
+        // All text blocks in this message were collapsed into one OAI content string.
+        // Replace the first text block with the full replacement; clear the rest.
+        return block
       }
       return block
     })
+
+    // If there's a replacement, apply it to the text blocks
+    if (replacement !== undefined) {
+      const textIndices = newBlocks.reduce<number[]>((acc, b, i) => {
+        if (b.type === 'textBlock') acc.push(i)
+        return acc
+      }, [])
+      if (textIndices.length > 0) {
+        newBlocks[textIndices[0]] = new TextBlock(replacement)
+        for (let i = 1; i < textIndices.length; i++) {
+          newBlocks[textIndices[i]] = new TextBlock('')
+        }
+      }
+    }
+
     result.push(new Message({ role: msg.role, content: newBlocks }))
   }
   return result

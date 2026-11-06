@@ -597,3 +597,40 @@ describe('toolSpecsToOpenAI', () => {
     expect(result[0].function.parameters).toEqual({})
   })
 })
+
+// ---------------------------------------------------------------------------
+// Guard timeout
+// ---------------------------------------------------------------------------
+
+describe('guard timeout', () => {
+  it('defaults guardTimeoutMs to 30000', () => {
+    const m = new AIGuardModel(downstream, {}, { token: 'test-token' })
+    expect(m.guardTimeoutMs).toBe(30_000)
+  })
+
+  it('accepts custom guardTimeoutMs', () => {
+    const m = new AIGuardModel(downstream, {}, { token: 'test-token', guardTimeoutMs: 5_000 })
+    expect(m.guardTimeoutMs).toBe(5_000)
+  })
+
+  it('rejects with AbortError when guard hangs past timeout', async () => {
+    vi.useFakeTimers()
+
+    const m = new AIGuardModel(downstream, {}, { token: 'test-token', guardTimeoutMs: 100 })
+    const aidrInstance = (AIGuard as unknown as Mock).mock.results.at(-1)?.value
+
+    // Simulate a guard call that never resolves
+    aidrInstance.guardChatCompletions.mockImplementation(
+      () => new Promise<never>(() => {}),
+    )
+
+    const streamPromise = collectEvents(m.stream([userMsg('hello')]))
+
+    // Advance timers past the timeout
+    await vi.advanceTimersByTimeAsync(200)
+
+    await expect(streamPromise).rejects.toThrow()
+
+    vi.useRealTimers()
+  })
+})
